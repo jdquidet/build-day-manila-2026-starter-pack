@@ -67,7 +67,7 @@ async def run_practice(camera: int, fps: int) -> None:
 
 async def run_live() -> None:
     """Run the agent in live mode against the game server."""
-    from api import CasperAPI, NoActiveRound
+    from api import CasperAPI, MaxGuessesReached, NoActiveRound, Unauthorized
     from core import start_stream
 
     from agent.prompt import analyze
@@ -82,6 +82,9 @@ async def run_live() -> None:
 
     try:
         feed = await client.get_feed()
+    except Unauthorized:
+        print("[!] Unauthorized. Check TEAM_TOKEN matches your team's API key.")
+        sys.exit(1)
     except NoActiveRound:
         print("[!] No active round. Wait for the admin to start one.")
         sys.exit(1)
@@ -101,8 +104,20 @@ async def run_live() -> None:
 
             if guess:
                 guess_count += 1
-                result = await client.guess(guess)
-                print(f"  [guess #{guess_count}] {guess}")
+                try:
+                    result = await client.guess(guess)
+                except Unauthorized:
+                    print("[!] Unauthorized. Check TEAM_TOKEN matches your team's API key.")
+                    break
+                except NoActiveRound:
+                    print("[!] No active round (round may have ended).")
+                    break
+                except MaxGuessesReached:
+                    print("[!] Maximum guesses reached for this round.")
+                    break
+
+                id_suffix = f" id={result.guess_id}" if result.guess_id is not None else ""
+                print(f"  [guess #{guess_count}{id_suffix}] {guess}")
 
                 if result.correct:
                     print()
