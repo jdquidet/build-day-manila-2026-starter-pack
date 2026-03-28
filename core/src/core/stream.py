@@ -64,10 +64,7 @@ async def start_stream(url: str, token: str) -> AsyncIterator[Frame]:
         for _identity, participant in room.remote_participants.items():
             for _tid, publication in participant.track_publications.items():
                 t = publication.track
-                if (
-                    publication.kind == TrackKind.KIND_VIDEO
-                    and t is not None
-                ):
+                if publication.kind == TrackKind.KIND_VIDEO and t is not None:
                     start_pump_for_track(t)
 
         try:
@@ -112,7 +109,7 @@ async def _pump_video_to_queue(stream, queue: asyncio.Queue[Frame]) -> None:
             vf = event.frame
             rgb = vf.convert(VideoBufferType.RGB24)
             raw = rgb.data.tobytes()
-            image = Image.frombytes("RGB", (rgb.width, rgb.height), raw)
+            image = Image.frombytes("RGB", (vf.width, vf.height), raw)
             ts = datetime.fromtimestamp(
                 event.timestamp_us / 1_000_000.0,
                 tz=timezone.utc,

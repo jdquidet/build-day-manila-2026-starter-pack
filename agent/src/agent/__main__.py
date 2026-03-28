@@ -1,8 +1,9 @@
 """Casper Agent CLI entry point.
 
 Usage:
-    uv run -m agent --practice     # Local camera, no network
-    uv run -m agent --live         # Connect to live game
+    uv run -m agent --practice              # Local camera, no network
+    uv run -m agent --practice --url URL    # Network video stream
+    uv run -m agent --live                  # Connect to live game
 """
 
 from __future__ import annotations
@@ -38,7 +39,13 @@ def parse_args() -> argparse.Namespace:
         "--camera",
         type=int,
         default=0,
-        help="Camera device index for practice mode (default: 0)",
+        help="(deprecated, unused)",
+    )
+    parser.add_argument(
+        "--url",
+        type=str,
+        default="http://192.168.9.59:5000/video",
+        help="Network video stream URL for practice mode",
     )
     parser.add_argument(
         "--fps",
@@ -49,19 +56,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-async def run_practice(camera: int, fps: int) -> None:
-    """Run the agent in practice mode with a local camera."""
-    from core import start_practice
+async def run_practice(camera: int, fps: int, url: str) -> None:
+    """Run the agent in practice mode with a network stream."""
+    from core import start_network_stream
 
     from agent.prompt import analyze
 
     print("=" * 50)
     print("  PRACTICE MODE")
-    print("  Local camera — no network required")
+    print(f"  Network stream: {url}")
     print("=" * 50)
     print()
 
-    async for frame in start_practice(camera_index=camera, fps=fps):
+    async for frame in start_network_stream(url, fps=fps):
         guess = await analyze(frame)
         if guess:
             print(f"  [guess] {guess}")
@@ -130,7 +137,9 @@ async def run_live() -> None:
                             await asyncio.sleep(delay)
                             n_503 += 1
                 except Unauthorized:
-                    print("[!] Unauthorized. Check TEAM_TOKEN matches your team's API key.")
+                    print(
+                        "[!] Unauthorized. Check TEAM_TOKEN matches your team's API key."
+                    )
                     break
                 except NoActiveRound:
                     print("[!] No active round (round may have ended).")
@@ -148,7 +157,9 @@ async def run_live() -> None:
                     continue
 
                 guess_count += 1
-                id_suffix = f" id={result.guess_id}" if result.guess_id is not None else ""
+                id_suffix = (
+                    f" id={result.guess_id}" if result.guess_id is not None else ""
+                )
                 print(f"  [guess #{guess_count}{id_suffix}] {guess}")
 
                 if result.correct:
@@ -171,7 +182,7 @@ async def main() -> None:
     args = parse_args()
 
     if args.practice:
-        await run_practice(camera=args.camera, fps=args.fps)
+        await run_practice(camera=args.camera, fps=args.fps, url=args.url)
     else:
         await run_live()
 
@@ -182,4 +193,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nBye!")
         import os
+
         os._exit(0)

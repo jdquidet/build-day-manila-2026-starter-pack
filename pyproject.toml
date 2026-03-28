@@ -5,6 +5,7 @@ description = "Starter template for building AI agents in the Casper Studios gue
 requires-python = ">=3.10"
 dependencies = [
     "agent",
+    "pydantic-ai>=0.2",
 ]
 
 [tool.uv.sources]

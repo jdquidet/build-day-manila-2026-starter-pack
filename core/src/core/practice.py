@@ -1,4 +1,4 @@
-"""Practice mode: capture frames from a local camera via ffmpeg subprocess."""
+"""Practice mode: capture frames from a local camera or network stream via ffmpeg."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ def _detect_ffmpeg() -> str:
         return path
     try:
         import imageio_ffmpeg
+
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         pass
@@ -51,12 +52,20 @@ def _build_capture_cmd(ffmpeg: str, camera_index: int) -> list[str]:
 
     return [
         ffmpeg,
-        "-hide_banner", "-loglevel", "error",
+        "-hide_banner",
+        "-loglevel",
+        "error",
         *input_fmt,
-        "-i", device,
-        "-vframes", "1",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-vcodec", "rawvideo",
+        "-i",
+        device,
+        "-vframes",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-vcodec",
+        "rawvideo",
         "pipe:1",
     ]
 
@@ -117,10 +126,83 @@ async def start_practice(
 
     try:
         test_frame = await _capture_one_frame(cmd)
-        print(f"[practice] Camera {camera_index} ready "
-              f"({test_frame.size[0]}x{test_frame.size[1]}).\n")
+        print(
+            f"[practice] Camera {camera_index} ready "
+            f"({test_frame.size[0]}x{test_frame.size[1]}).\n"
+        )
     except Exception as exc:
         print(f"[!] Could not capture from camera {camera_index}: {exc}")
+        return
+
+    while True:
+        try:
+            image = await _capture_one_frame(cmd)
+
+            yield Frame(
+                image=image,
+                timestamp=datetime.now(timezone.utc),
+            )
+
+            await asyncio.sleep(interval)
+
+        except KeyboardInterrupt:
+            print("\n[practice] Stopped.")
+            break
+        except Exception as exc:
+            print(f"[practice] Error capturing frame: {exc}")
+            break
+
+
+def _build_network_cmd(ffmpeg: str, url: str) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "nobuffer",
+        "-flags",
+        "low_delay",
+        "-probesize",
+        "32",
+        "-analyzeduration",
+        "0",
+        "-i",
+        url,
+        "-vframes",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-vcodec",
+        "rawvideo",
+        "pipe:1",
+    ]
+
+
+async def start_network_stream(
+    url: str,
+    fps: int = 1,
+) -> AsyncIterator[Frame]:
+    interval = 1.0 / fps
+
+    print(f"[practice] Opening network stream: {url}")
+    print(f"[practice] Sampling at {fps} FPS. Press Ctrl+C to stop.\n")
+
+    try:
+        ffmpeg = _detect_ffmpeg()
+    except FileNotFoundError as exc:
+        print(f"[!] {exc}")
+        return
+
+    cmd = _build_network_cmd(ffmpeg, url)
+
+    try:
+        test_frame = await _capture_one_frame(cmd)
+        print(f"[practice] Stream ready ({test_frame.size[0]}x{test_frame.size[1]}).\n")
+    except Exception as exc:
+        print(f"[!] Could not capture from stream: {exc}")
         return
 
     while True:
