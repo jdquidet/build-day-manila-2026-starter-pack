@@ -2,17 +2,18 @@
 
 === EDIT THIS FILE ===
 
-Strategy (flipped two-stage pipeline, sequential):
-1. Every 4 seconds, collect all frames (~40 at 10fps) from the raw stream
-2. Send each 4-second batch to the strong model (Sonnet) and WAIT for the
-   result — Sonnet sees the full motion sequence and produces 1 initial guess
-3. After 6 windows, the fast model (Haiku) receives only the 6 text guesses
-   + history and picks the best consensus answer
+Strategy (flipped two-stage pipeline, strict wall-clock timing):
+1. A background pipeline runs on strict wall-clock schedule
+2. Every _WINDOW_DURATION_S seconds, grab all buffered frames and fire off
+   a strong model (o3) call as a background task (fire-and-forget)
+3. After _WINDOWS_PER_CYCLE windows, wait for all o3 tasks to finish, then
+   send the text guesses to the fast model (Gemini 3.1 Pro) for consensus
 4. If wrong, the next cycle carries forward all prior guesses as context
 """
 
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 
@@ -41,14 +42,14 @@ from core import Frame
 # Models
 # ---------------------------------------------------------------------------
 
-INITIAL_MODEL = "openrouter:anthropic/claude-sonnet-4"       # strong — reads frames
-FINAL_MODEL = "openrouter:anthropic/claude-haiku-4.5"        # fast — text consensus
+INITIAL_MODEL = "openrouter:openai/o3"                       # strong — reads frames
+FINAL_MODEL = "openrouter:google/gemini-3.1-pro-preview"     # fast — text consensus
 
 # ---------------------------------------------------------------------------
 # Timing constants (placeholders — tune these during practice)
 # ---------------------------------------------------------------------------
 
-_WINDOW_DURATION_S = 1      # seconds of frame collection per window
+_WINDOW_DURATION_S = 1        # seconds of frame collection per window
 _WINDOWS_PER_CYCLE = 3        # number of initial guesses before final guess
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,7 @@ You are playing a charades guessing game. A human person is standing in front
 of a camera acting out a word or phrase using only body language, gestures, and
 pantomime — no speaking, no written words, no props with text.
 
-You will receive a sequence of frames captured over a 4-second window from the
+You will receive a sequence of frames captured over a short window from the
 live camera feed. The frames show the person's movements in chronological order,
 so you can observe how their gestures evolve over time.
 
@@ -96,8 +97,8 @@ You are the final judge in a charades guessing game. A human person has been
 acting out a word or phrase in front of a camera.
 
 You will receive:
-- A set of initial guesses from a vision model that watched consecutive
-  4-second windows of the person's performance (one guess per window)
+- A set of initial guesses from o3 (a vision model) that watched consecutive
+  windows of the person's performance (one guess per window)
 - A history of all previous guesses and outcomes from prior cycles (if any)
 
 Your job is to find the consensus across the initial guesses and produce the
@@ -143,12 +144,23 @@ def _get_final_agent() -> Agent:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-# Cycle state
-_window_start_time: float | None = None
-_window_frames: list[Frame] = []            # frames for current 4s window
-_initial_guesses: list[str] = []            # completed initial guesses this cycle
-_guess_counter: int = 0                     # for printing [initial #N]
-_cycle_counter: int = 0                     # which cycle we are on
+# Shared frame buffer — analyze() writes, pipeline reads
+_window_frames: list[Frame] = []
+
+# Completed initial guesses for the current cycle
+_initial_guesses: list[str] = []
+
+# In-flight o3 tasks
+_o3_tasks: list[asyncio.Task] = []
+
+# Final result from the pipeline (set when cycle is complete)
+_final_result: str | None = None
+
+# Whether the background pipeline is currently running
+_pipeline_running: bool = False
+
+# Cycle counter for display
+_cycle_counter: int = 0
 
 # History of all cycles: list of {"initial_guesses": [...], "final_guess": str}
 _history: list[dict] = []
@@ -156,12 +168,13 @@ _history: list[dict] = []
 
 def _reset_cycle() -> None:
     """Reset all cycle state for the next iteration."""
-    global _window_start_time, _window_frames
-    global _initial_guesses, _guess_counter
-    _window_start_time = None
+    global _window_frames, _initial_guesses, _o3_tasks
+    global _final_result, _pipeline_running
     _window_frames = []
     _initial_guesses = []
-    _guess_counter = 0
+    _o3_tasks = []
+    _final_result = None
+    _pipeline_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -176,14 +189,14 @@ def _image_to_bytes(image) -> bytes:
 
 
 async def _initial_guess(frames: list[Frame]) -> str:
-    """Send a batch of frames (one 4-second window) to the strong model."""
+    """Send a batch of frames (one window) to o3 (strong model)."""
     # Build message parts: all frames as images + text prompt
     parts: list = []
     for frame in frames:
         image_bytes = _image_to_bytes(frame.image)
         parts.append(BinaryContent(data=image_bytes, media_type="image/jpeg"))
 
-    # Include history of wrong guesses so Sonnet avoids repeating them
+    # Include history of wrong guesses so the model avoids repeating them
     history_note = ""
     if _history:
         wrong_guesses = [entry["final_guess"] for entry in _history]
@@ -195,8 +208,9 @@ async def _initial_guess(frames: list[Frame]) -> str:
         )
 
     parts.append(
-        f"Here are {len(frames)} consecutive frames from a 4-second window of "
-        f"a charades game. The person is acting out a word or phrase. "
+        f"Here are {len(frames)} consecutive frames from a "
+        f"{_WINDOW_DURATION_S}-second window of a charades game. The person is "
+        f"acting out a word or phrase. "
         f"What is the person acting out? Give your best guess."
         f"{history_note}"
     )
@@ -205,11 +219,27 @@ async def _initial_guess(frames: list[Frame]) -> str:
     return result.output.strip()
 
 
+async def _o3_wrapper(frames: list[Frame], task_num: int) -> None:
+    """Fire-and-forget wrapper: run o3 initial guess, collect result, print."""
+    start = time.monotonic()
+    try:
+        guess = await _initial_guess(frames)
+        elapsed = time.monotonic() - start
+        _initial_guesses.append(guess)
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"{guess} ({len(frames)} frames, {elapsed:.1f}s)")
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"ERROR: {e} ({elapsed:.1f}s)")
+
+
 async def _final_guess(initial_guesses: list[str]) -> str:
-    """Send only text guesses + history to the fast model for consensus."""
+    """Send only text guesses + history to Gemini 3.1 Pro (fast model) for consensus."""
     text_lines = [
-        f"Here are {len(initial_guesses)} initial guesses from a vision model "
-        f"that watched a person playing charades (one guess per 4-second window):"
+        f"Here are {len(initial_guesses)} initial guesses from o3 (a vision "
+        f"model) that watched a person playing charades (one guess per "
+        f"{_WINDOW_DURATION_S}-second window):"
     ]
     text_lines.append("")
     for i, guess in enumerate(initial_guesses, 1):
@@ -243,98 +273,113 @@ async def _final_guess(initial_guesses: list[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Background pipeline — runs on strict wall-clock timing
+# ---------------------------------------------------------------------------
+
+async def _run_pipeline() -> None:
+    """Background coroutine: manages windows on a strict wall-clock schedule.
+
+    - Every _WINDOW_DURATION_S seconds, grabs all buffered frames and launches
+      a fire-and-forget strong model (o3) task
+    - After _WINDOWS_PER_CYCLE windows, waits for all tasks, then runs the
+      fast model (Gemini) for the final consensus guess
+    """
+    global _final_result, _cycle_counter
+
+    _cycle_counter += 1
+    cycle_duration = _WINDOW_DURATION_S * _WINDOWS_PER_CYCLE
+    print(f"  [agent] Cycle {_cycle_counter} started "
+          f"({_WINDOWS_PER_CYCLE} windows x {_WINDOW_DURATION_S:.0f}s "
+          f"= {cycle_duration:.0f}s)")
+
+    # Launch one fire-and-forget task per window on strict timing
+    for window_num in range(1, _WINDOWS_PER_CYCLE + 1):
+        # Wait exactly _WINDOW_DURATION_S seconds (real wall-clock)
+        await asyncio.sleep(_WINDOW_DURATION_S)
+
+        # Grab all frames buffered during this window
+        frames = _window_frames[:]
+        _window_frames.clear()
+
+        if not frames:
+            print(f"  [agent] Window {window_num}/{_WINDOWS_PER_CYCLE} — "
+                  f"no frames collected, skipping")
+            continue
+
+        # Fire-and-forget o3 call
+        print(f"  [agent] Window {window_num}/{_WINDOWS_PER_CYCLE} — "
+              f"{len(frames)} frames → o3 (fire-and-forget)")
+        task = asyncio.create_task(_o3_wrapper(frames, window_num))
+        _o3_tasks.append(task)
+
+    # All windows dispatched — wait for any pending o3 tasks
+    if _o3_tasks:
+        pending = [t for t in _o3_tasks if not t.done()]
+        if pending:
+            print(f"  [agent] Waiting for {len(pending)} remaining o3 task(s)...")
+        await asyncio.gather(*_o3_tasks)
+
+    # Check we have usable guesses
+    if not _initial_guesses:
+        print("  [agent] No initial guesses collected — skipping this cycle.")
+        _reset_cycle()
+        return
+
+    non_skip = [g for g in _initial_guesses if g.upper() != "SKIP"]
+    if not non_skip:
+        print("  [agent] All initial guesses were SKIP — skipping this cycle.")
+        _reset_cycle()
+        return
+
+    # Run fast model for final consensus (text-only)
+    print(f"  [agent] Final guess (Gemini): {len(_initial_guesses)} initial "
+          f"guesses → consensus...")
+    final = await _final_guess(_initial_guesses)
+    print(f"  [agent] Final guess: {final}")
+
+    # Record in history
+    _history.append({
+        "initial_guesses": list(_initial_guesses),
+        "final_guess": final,
+    })
+
+    # Signal result to analyze()
+    if final.upper() != "SKIP":
+        _final_result = final
+    else:
+        print("  [agent] Final model said SKIP — skipping.")
+        _reset_cycle()
+
+
+# ---------------------------------------------------------------------------
 # Main entry point — called by __main__.py for every frame
 # ---------------------------------------------------------------------------
 
 async def analyze(frame: Frame) -> str | None:
     """Analyze a single frame and return a guess, or None to skip.
 
-    Internally:
-    - Buffers frames into 4-second windows
-    - At the end of each window, sends all frames to Sonnet and WAITS for the
-      result (blocking — no fire-and-forget)
-    - After collecting the configured number of initial guesses, sends them
-      to Haiku for a final consensus answer
-    - Returns None while buffering/waiting, returns the final guess when ready
+    This function is non-blocking. It:
+    - Buffers every frame into a shared list
+    - On first call, starts a background pipeline coroutine that runs on
+      strict wall-clock timing (asyncio.sleep-based)
+    - Checks if the background pipeline has produced a final result
+    - Returns the result when ready, None otherwise
     """
-    global _window_start_time, _guess_counter, _cycle_counter
+    global _pipeline_running
 
-    now = time.monotonic()
-
-    # --- Initialize window on first call ---
-    if _window_start_time is None:
-        _window_start_time = now
-        if _guess_counter == 0:
-            _cycle_counter += 1
-            print(f"  [agent] Cycle {_cycle_counter} started "
-                  f"({_WINDOWS_PER_CYCLE} windows x {_WINDOW_DURATION_S:.0f}s)")
-
-    # --- Always buffer the frame ---
+    # Always buffer the frame (never blocks)
     _window_frames.append(frame)
 
-    # --- Check if current 4s window is complete ---
-    window_elapsed = now - _window_start_time
-    if window_elapsed < _WINDOW_DURATION_S:
+    # Start background pipeline on first frame of a cycle
+    if not _pipeline_running:
+        _pipeline_running = True
+        asyncio.create_task(_run_pipeline())
         return None
 
-    # --- Window complete: send frames to Sonnet and wait ---
-    _guess_counter += 1
-    task_num = _guess_counter
-    frames = _window_frames[:]
-    _window_frames.clear()
-    _window_start_time = now  # reset for next window
-
-    print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} — "
-          f"{len(frames)} frames → Sonnet (awaiting)...")
-    start = time.monotonic()
-    try:
-        guess = await _initial_guess(frames)
-        elapsed = time.monotonic() - start
-        _initial_guesses.append(guess)
-        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
-              f"{guess} ({len(frames)} frames, {elapsed:.1f}s)")
-    except Exception as e:
-        elapsed = time.monotonic() - start
-        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
-              f"ERROR: {e} ({elapsed:.1f}s)")
-
-    # --- Check if we have all initial guesses for this cycle ---
-    if _guess_counter < _WINDOWS_PER_CYCLE:
-        return None
-
-    # --- All windows done: run Haiku for final consensus ---
-
-    # Check we have guesses to work with
-    if not _initial_guesses:
-        print("  [agent] No initial guesses collected — skipping this cycle.")
+    # Check if pipeline produced a result
+    if _final_result is not None:
+        result = _final_result
         _reset_cycle()
-        return None
+        return result
 
-    # Filter out SKIPs
-    non_skip = [g for g in _initial_guesses if g.upper() != "SKIP"]
-    if not non_skip:
-        print("  [agent] All initial guesses were SKIP — skipping this cycle.")
-        _reset_cycle()
-        return None
-
-    # Run Haiku
-    print(f"  [agent] Final guess (Haiku): {len(_initial_guesses)} initial "
-          f"guesses → consensus...")
-    final_guess = await _final_guess(_initial_guesses)
-    print(f"  [agent] Final guess: {final_guess}")
-
-    # Record in history
-    _history.append({
-        "initial_guesses": list(_initial_guesses),
-        "final_guess": final_guess,
-    })
-
-    # Reset for next cycle
-    _reset_cycle()
-
-    # Don't return SKIP from the final model
-    if final_guess.upper() == "SKIP":
-        print("  [agent] Final model said SKIP — skipping.")
-        return None
-
-    return final_guess
+    return None
