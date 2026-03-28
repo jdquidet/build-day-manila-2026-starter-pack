@@ -2,17 +2,37 @@
 
 === EDIT THIS FILE ===
 
-Strategy (two-stage pipeline with history):
-1. Buffer 3 frames over ~3 seconds
-2. Send each frame to a fast model (haiku) in parallel → 3 initial guesses
-3. Send all 3 frames + initial guesses + history to a strong model (sonnet) → 1 final guess
-4. If wrong, the next iteration carries forward all prior guesses as context
+Strategy (flipped two-stage pipeline):
+1. Every 4 seconds, collect all frames (~40 at 10fps) from the raw stream
+2. Send each 4-second batch to the strong model (Sonnet) as a fire-and-forget
+   task — Sonnet sees the full motion sequence and produces 1 initial guess
+3. After 6 windows (24 seconds), the fast model (Haiku) receives only the 6
+   text guesses + history and picks the best consensus answer
+4. If wrong, the next cycle carries forward all prior guesses as context
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
+import time
+
+# ---------------------------------------------------------------------------
+# Monkey-patch: pydantic-ai 1.73.0's OpenRouter provider rejects
+# service_tier="standard" returned by OpenRouter. Patch the validation
+# model to accept it before any agent call is made.
+# ---------------------------------------------------------------------------
+from openai.types.chat import ChatCompletion as _ChatCompletion
+
+_orig_service_tier = _ChatCompletion.model_fields["service_tier"]
+if "standard" not in str(_orig_service_tier.annotation):
+    from typing import Literal, Optional
+
+    _ChatCompletion.model_fields["service_tier"].annotation = Optional[
+        Literal["auto", "default", "flex", "scale", "priority", "standard"]
+    ]
+    _ChatCompletion.model_rebuild()
+# ---------------------------------------------------------------------------
 
 from pydantic_ai import Agent, BinaryContent
 
@@ -22,42 +42,72 @@ from core import Frame
 # Models
 # ---------------------------------------------------------------------------
 
-FAST_MODEL = "anthropic:claude-3-5-haiku-20241022"
-STRONG_MODEL = "anthropic:claude-sonnet-4-20250514"
+INITIAL_MODEL = "openrouter:anthropic/claude-sonnet-4"       # strong — reads frames
+FINAL_MODEL = "openrouter:anthropic/claude-haiku-4.5"        # fast — text consensus
 
 # ---------------------------------------------------------------------------
 # System prompts
 # ---------------------------------------------------------------------------
 
-FAST_SYSTEM_PROMPT = """\
-You are playing a visual guessing game. You will receive a screenshot from a
-live camera feed. Your goal is to identify what is being shown as quickly and
-accurately as possible.
+INITIAL_SYSTEM_PROMPT = """\
+You are playing a charades guessing game. A human person is standing in front
+of a camera acting out a word or phrase using only body language, gestures, and
+pantomime — no speaking, no written words, no props with text.
+
+You will receive a sequence of frames captured over a 4-second window from the
+live camera feed. The frames show the person's movements in chronological order,
+so you can observe how their gestures evolve over time.
+
+Important — distinguish between two types of acting:
+1. STATIC (symbol/pose): The person holds a pose or forms a shape with their
+   hands or body to represent a concept or object. If the pose is roughly the
+   same across the frames, it is likely a static gesture. Examples: hands
+   forming a heart shape = "love", arms spread wide and still = "airplane",
+   flexing biceps = "strong", hands on head like antlers = "deer".
+2. DYNAMIC (action/movement): The person is performing a movement or imitating
+   an activity or animal. If the pose changes significantly across the frames,
+   it is likely a dynamic gesture. Examples: swinging arms = "swimming",
+   pretending to kick a ball = "soccer", crawling = "baby" or "snake",
+   swinging an imaginary bat = "baseball".
+
+Recognizing which type you are seeing helps narrow your guess.
 
 Rules:
-- Give your best guess as a short, specific answer (1-5 words).
-- If you truly cannot tell what is being shown, respond with exactly "SKIP".
-- Be specific: "golden retriever" is better than "dog".
-- Focus on the main subject of the image.
+- Give your best guess as a short answer (1-5 words).
+- Guesses should be things commonly used in charades: everyday words, actions,
+  animals, emotions, movie titles, book titles, song titles, famous people,
+  occupations, sports, or common phrases.
+- Focus entirely on the person's gestures, poses, and movements — ignore
+  background objects, furniture, and the room itself.
+- Think about what concept or thing the body language represents, not what you
+  literally see.
+- If you truly cannot interpret what is being acted out, respond with exactly
+  "SKIP".
 """
 
-STRONG_SYSTEM_PROMPT = """\
-You are the final judge in a visual guessing game. You will receive:
-- 3 frames captured over ~3 seconds from a live camera feed
-- 3 initial guesses from a fast screening model (one per frame)
-- A history of all previous guesses and outcomes from prior rounds (if any)
+FINAL_SYSTEM_PROMPT = """\
+You are the final judge in a charades guessing game. A human person has been
+acting out a word or phrase in front of a camera for the past 24 seconds.
 
-Your job is to synthesize all of this information and produce the single best,
-most accurate guess for what is being shown.
+You will receive:
+- 6 initial guesses from a vision model that watched 6 consecutive 4-second
+  windows of the person's performance (one guess per window)
+- A history of all previous guesses and outcomes from prior cycles (if any)
+
+Your job is to find the consensus across the 6 initial guesses and produce the
+single best, most accurate charades answer.
 
 Rules:
-- Give exactly ONE guess as a short, specific answer (1-5 words).
-- Be specific: "golden retriever" is better than "dog".
-- Consider the consensus across the 3 initial guesses — if they agree, that's
-  a strong signal.
-- If they disagree, use the frames themselves to decide.
+- Give exactly ONE guess as a short answer (1-5 words).
+- Guesses must be things commonly acted out in charades: everyday words,
+  actions, animals, emotions, movie titles, book titles, song titles, famous
+  people, occupations, sports, or common phrases.
+- Look for patterns in the 6 initial guesses — if most agree on a word or
+  theme, that is a strong signal.
+- If the guesses are split, consider which answer best fits the charades
+  context.
 - Use the history to AVOID repeating wrong guesses. If a guess was already
-  tried and was wrong, pick something different.
+  tried and was wrong, pick something different or more specific.
 - Respond with ONLY your guess, nothing else.
 """
 
@@ -65,37 +115,60 @@ Rules:
 # Agents (lazily initialized — env vars must be loaded before first use)
 # ---------------------------------------------------------------------------
 
-_fast_agent: Agent | None = None
-_strong_agent: Agent | None = None
+_initial_agent: Agent | None = None
+_final_agent: Agent | None = None
 
 
-def _get_fast_agent() -> Agent:
-    global _fast_agent
-    if _fast_agent is None:
-        _fast_agent = Agent(FAST_MODEL, system_prompt=FAST_SYSTEM_PROMPT)
-    return _fast_agent
+def _get_initial_agent() -> Agent:
+    global _initial_agent
+    if _initial_agent is None:
+        _initial_agent = Agent(INITIAL_MODEL, system_prompt=INITIAL_SYSTEM_PROMPT)
+    return _initial_agent
 
 
-def _get_strong_agent() -> Agent:
-    global _strong_agent
-    if _strong_agent is None:
-        _strong_agent = Agent(STRONG_MODEL, system_prompt=STRONG_SYSTEM_PROMPT)
-    return _strong_agent
+def _get_final_agent() -> Agent:
+    global _final_agent
+    if _final_agent is None:
+        _final_agent = Agent(FINAL_MODEL, system_prompt=FINAL_SYSTEM_PROMPT)
+    return _final_agent
 
 
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
 
-# Buffer for collecting frames before running the pipeline
-_frame_buffer: list[Frame] = []
+# Timing constants
+_WINDOW_DURATION_S = 4.0      # seconds per initial-guess window
+_WINDOWS_PER_CYCLE = 6        # number of windows before a final guess (4 x 6 = 24s)
 
-# History of all iterations: list of {"initial_guesses": [...], "final_guess": str}
+# Cycle state
+_cycle_start_time: float | None = None
+_window_start_time: float | None = None
+_window_frames: list[Frame] = []            # frames for current 4s window
+_pending_tasks: list[asyncio.Task] = []     # in-flight Sonnet tasks
+_initial_guesses: list[str] = []            # completed initial guesses this cycle
+_guess_counter: int = 0                     # for printing [initial #N/6]
+_cycle_counter: int = 0                     # which cycle we are on
+
+# History of all cycles: list of {"initial_guesses": [...], "final_guess": str}
 _history: list[dict] = []
 
-# How many frames to collect before running the pipeline
-_FRAMES_PER_BATCH = 3
 
+def _reset_cycle() -> None:
+    """Reset all cycle state for the next iteration."""
+    global _cycle_start_time, _window_start_time, _window_frames
+    global _pending_tasks, _initial_guesses, _guess_counter
+    _cycle_start_time = None
+    _window_start_time = None
+    _window_frames = []
+    _pending_tasks = []
+    _initial_guesses = []
+    _guess_counter = 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _image_to_bytes(image) -> bytes:
     """Convert a PIL Image to JPEG bytes for sending to the LLM."""
@@ -104,41 +177,72 @@ def _image_to_bytes(image) -> bytes:
     return buf.getvalue()
 
 
-async def _fast_guess(frame: Frame) -> str:
-    """Send a single frame to the fast model and get a guess."""
-    image_bytes = _image_to_bytes(frame.image)
-    result = await _get_fast_agent().run([
-        BinaryContent(data=image_bytes, media_type="image/jpeg"),
-        "What is being shown in this image? Give your best guess.",
-    ])
-    return result.output.strip()
-
-
-async def _strong_guess(
-    frames: list[Frame],
-    initial_guesses: list[str],
-) -> str:
-    """Send all frames + initial guesses + history to the strong model."""
-    # Build the message parts: all 3 images first
+async def _initial_guess(frames: list[Frame]) -> str:
+    """Send a batch of frames (one 4-second window) to the strong model."""
+    # Build message parts: all frames as images + text prompt
     parts: list = []
-    for i, frame in enumerate(frames):
+    for frame in frames:
         image_bytes = _image_to_bytes(frame.image)
         parts.append(BinaryContent(data=image_bytes, media_type="image/jpeg"))
 
-    # Build the text prompt with initial guesses and history
-    text_lines = ["Here are 3 frames from the live camera feed (attached above)."]
+    # Include history of wrong guesses so Sonnet avoids repeating them
+    history_note = ""
+    if _history:
+        wrong_guesses = [entry["final_guess"] for entry in _history]
+        history_note = (
+            "\n\nIMPORTANT: The following guesses have already been tried and "
+            "were WRONG: " + ", ".join(wrong_guesses) + ". "
+            "Do NOT suggest any of these. Try a completely different "
+            "interpretation of the person's gestures."
+        )
+
+    parts.append(
+        f"Here are {len(frames)} consecutive frames from a 4-second window of "
+        f"a charades game. The person is acting out a word or phrase. "
+        f"What is the person acting out? Give your best guess."
+        f"{history_note}"
+    )
+
+    result = await _get_initial_agent().run(parts)
+    return result.output.strip()
+
+
+async def _initial_guess_task(frames: list[Frame], task_num: int) -> None:
+    """Fire-and-forget wrapper: run initial guess, collect result, print."""
+    start = time.monotonic()
+    try:
+        guess = await _initial_guess(frames)
+        elapsed = time.monotonic() - start
+        _initial_guesses.append(guess)
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"{guess} ({len(frames)} frames, {elapsed:.1f}s)")
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"ERROR: {e} ({elapsed:.1f}s)")
+
+
+async def _final_guess(initial_guesses: list[str]) -> str:
+    """Send only text guesses + history to the fast model for consensus."""
+    text_lines = [
+        "Here are 6 initial guesses from a vision model that watched a person "
+        "playing charades over the last 24 seconds (one guess per 4-second window):"
+    ]
     text_lines.append("")
-    text_lines.append("Initial guesses from the fast screening model:")
     for i, guess in enumerate(initial_guesses, 1):
-        text_lines.append(f"  Frame {i}: {guess}")
+        text_lines.append(f"  Window {i}: {guess}")
 
     if _history:
         text_lines.append("")
-        text_lines.append("=== HISTORY OF PREVIOUS ATTEMPTS ===")
-        for iteration_num, entry in enumerate(_history, 1):
-            text_lines.append(f"Iteration {iteration_num}:")
-            text_lines.append(f"  Initial guesses: {', '.join(entry['initial_guesses'])}")
-            text_lines.append(f"  Final guess submitted: {entry['final_guess']} (WRONG)")
+        text_lines.append("=== HISTORY OF PREVIOUS CYCLES ===")
+        for cycle_num, entry in enumerate(_history, 1):
+            text_lines.append(f"Cycle {cycle_num}:")
+            text_lines.append(
+                f"  Initial guesses: {', '.join(entry['initial_guesses'])}"
+            )
+            text_lines.append(
+                f"  Final guess submitted: {entry['final_guess']} (WRONG)"
+            )
         text_lines.append("")
         text_lines.append(
             "All previous final guesses were WRONG. Do NOT repeat them. "
@@ -147,74 +251,119 @@ async def _strong_guess(
 
     text_lines.append("")
     text_lines.append(
-        "Based on the frames, the initial guesses, and the history above, "
+        "Based on the initial guesses and the history above, "
         "what is your single best guess? Respond with ONLY the guess (1-5 words)."
     )
 
-    parts.append("\n".join(text_lines))
-
-    result = await _get_strong_agent().run(parts)
+    result = await _get_final_agent().run("\n".join(text_lines))
     return result.output.strip()
 
+
+# ---------------------------------------------------------------------------
+# Main entry point — called by __main__.py for every frame
+# ---------------------------------------------------------------------------
 
 async def analyze(frame: Frame) -> str | None:
     """Analyze a single frame and return a guess, or None to skip.
 
-    Internally buffers 3 frames, then runs the two-stage pipeline:
-    1. Fast model (haiku) on each frame in parallel → 3 initial guesses
-    2. Strong model (sonnet) synthesizes a final guess from all data + history
-
-    Returns None while buffering, returns the final guess on the 3rd frame.
+    Internally:
+    - Buffers frames into 4-second windows
+    - At the end of each window, fires off a Sonnet call (fire-and-forget)
+      with all ~40 frames from that window
+    - After 6 windows (24 seconds), waits for all Sonnet results, then
+      sends the 6 text guesses to Haiku for a final consensus answer
     """
-    global _frame_buffer
+    global _cycle_start_time, _window_start_time, _guess_counter, _cycle_counter
 
-    # --- Accumulate frames ---
-    _frame_buffer.append(frame)
+    now = time.monotonic()
 
-    if len(_frame_buffer) < _FRAMES_PER_BATCH:
-        remaining = _FRAMES_PER_BATCH - len(_frame_buffer)
-        print(f"  [agent] Buffering frame {len(_frame_buffer)}/{_FRAMES_PER_BATCH} "
-              f"({remaining} more to go)")
+    # --- Initialize cycle on first call ---
+    if _cycle_start_time is None:
+        _cycle_start_time = now
+        _window_start_time = now
+        _cycle_counter += 1
+        print(f"  [agent] Cycle {_cycle_counter} started "
+              f"({_WINDOWS_PER_CYCLE} windows x {_WINDOW_DURATION_S:.0f}s "
+              f"= {_WINDOWS_PER_CYCLE * _WINDOW_DURATION_S:.0f}s)")
+
+    # --- Always buffer the frame ---
+    _window_frames.append(frame)
+
+    # --- Check if current 4s window is complete ---
+    assert _window_start_time is not None
+    assert _cycle_start_time is not None
+    window_elapsed = now - _window_start_time
+    if window_elapsed >= _WINDOW_DURATION_S and _window_frames:
+        _guess_counter += 1
+        task_num = _guess_counter
+        frames = _window_frames[:]
+        _window_frames.clear()
+        _window_start_time = now
+
+        print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} — "
+              f"{len(frames)} frames → Sonnet (fire-and-forget)")
+        task = asyncio.create_task(
+            _initial_guess_task(frames, task_num)
+        )
+        _pending_tasks.append(task)
+
+    # --- Check if full cycle is complete (24s elapsed) ---
+    cycle_elapsed = now - _cycle_start_time
+    if cycle_elapsed < _WINDOW_DURATION_S * _WINDOWS_PER_CYCLE:
         return None
 
-    # --- We have 3 frames, run the pipeline ---
-    frames = _frame_buffer[:]
-    _frame_buffer.clear()
+    # Flush any remaining frames as a final partial window
+    if _window_frames:
+        _guess_counter += 1
+        task_num = _guess_counter
+        frames = _window_frames[:]
+        _window_frames.clear()
 
-    print(f"  [agent] Running two-stage pipeline (iteration {len(_history) + 1})...")
+        print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} (final flush) — "
+              f"{len(frames)} frames → Sonnet (fire-and-forget)")
+        task = asyncio.create_task(
+            _initial_guess_task(frames, task_num)
+        )
+        _pending_tasks.append(task)
 
-    # Stage 1: Fast model — 3 parallel calls
-    print("  [agent] Stage 1: Fast model (haiku) on 3 frames...")
-    initial_guesses_raw = await asyncio.gather(
-        _fast_guess(frames[0]),
-        _fast_guess(frames[1]),
-        _fast_guess(frames[2]),
-    )
-    initial_guesses = list(initial_guesses_raw)
+    # Wait for all in-flight Sonnet tasks to finish
+    if _pending_tasks:
+        pending_count = sum(1 for t in _pending_tasks if not t.done())
+        if pending_count > 0:
+            print(f"  [agent] Waiting for {pending_count} remaining Sonnet task(s)...")
+        await asyncio.gather(*_pending_tasks)
 
-    for i, guess in enumerate(initial_guesses, 1):
-        print(f"  [agent]   Frame {i} → {guess}")
+    # Check we have guesses to work with
+    if not _initial_guesses:
+        print("  [agent] No initial guesses collected — skipping this cycle.")
+        _reset_cycle()
+        return None
 
-    # Filter out SKIPs for display, but pass all to strong model
-    non_skip = [g for g in initial_guesses if g.upper() != "SKIP"]
+    # Filter out SKIPs
+    non_skip = [g for g in _initial_guesses if g.upper() != "SKIP"]
     if not non_skip:
-        print("  [agent] All 3 fast guesses were SKIP — skipping this batch.")
+        print("  [agent] All initial guesses were SKIP — skipping this cycle.")
+        _reset_cycle()
         return None
 
-    # Stage 2: Strong model — synthesize final guess
-    print("  [agent] Stage 2: Strong model (sonnet) synthesizing final guess...")
-    final_guess = await _strong_guess(frames, initial_guesses)
+    # --- Run Haiku for final consensus (text-only) ---
+    print(f"  [agent] Final guess (Haiku): {len(_initial_guesses)} initial "
+          f"guesses → consensus...")
+    final_guess = await _final_guess(_initial_guesses)
     print(f"  [agent] Final guess: {final_guess}")
 
     # Record in history
     _history.append({
-        "initial_guesses": initial_guesses,
+        "initial_guesses": list(_initial_guesses),
         "final_guess": final_guess,
     })
 
-    # Don't return SKIP from the strong model
+    # Reset for next cycle
+    _reset_cycle()
+
+    # Don't return SKIP from the final model
     if final_guess.upper() == "SKIP":
-        print("  [agent] Strong model said SKIP — skipping.")
+        print("  [agent] Final model said SKIP — skipping.")
         return None
 
     return final_guess
