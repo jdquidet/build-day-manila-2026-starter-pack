@@ -2,18 +2,17 @@
 
 === EDIT THIS FILE ===
 
-Strategy (flipped two-stage pipeline):
+Strategy (flipped two-stage pipeline, sequential):
 1. Every 4 seconds, collect all frames (~40 at 10fps) from the raw stream
-2. Send each 4-second batch to the strong model (Sonnet) as a fire-and-forget
-   task — Sonnet sees the full motion sequence and produces 1 initial guess
-3. After 6 windows (24 seconds), the fast model (Haiku) receives only the 6
-   text guesses + history and picks the best consensus answer
+2. Send each 4-second batch to the strong model (Sonnet) and WAIT for the
+   result — Sonnet sees the full motion sequence and produces 1 initial guess
+3. After 6 windows, the fast model (Haiku) receives only the 6 text guesses
+   + history and picks the best consensus answer
 4. If wrong, the next cycle carries forward all prior guesses as context
 """
 
 from __future__ import annotations
 
-import asyncio
 import io
 import time
 
@@ -44,6 +43,13 @@ from core import Frame
 
 INITIAL_MODEL = "openrouter:anthropic/claude-sonnet-4"       # strong — reads frames
 FINAL_MODEL = "openrouter:anthropic/claude-haiku-4.5"        # fast — text consensus
+
+# ---------------------------------------------------------------------------
+# Timing constants (placeholders — tune these during practice)
+# ---------------------------------------------------------------------------
+
+_WINDOW_DURATION_S = 1      # seconds of frame collection per window
+_WINDOWS_PER_CYCLE = 3        # number of initial guesses before final guess
 
 # ---------------------------------------------------------------------------
 # System prompts
@@ -87,14 +93,14 @@ Rules:
 
 FINAL_SYSTEM_PROMPT = """\
 You are the final judge in a charades guessing game. A human person has been
-acting out a word or phrase in front of a camera for the past 24 seconds.
+acting out a word or phrase in front of a camera.
 
 You will receive:
-- 6 initial guesses from a vision model that watched 6 consecutive 4-second
-  windows of the person's performance (one guess per window)
+- A set of initial guesses from a vision model that watched consecutive
+  4-second windows of the person's performance (one guess per window)
 - A history of all previous guesses and outcomes from prior cycles (if any)
 
-Your job is to find the consensus across the 6 initial guesses and produce the
+Your job is to find the consensus across the initial guesses and produce the
 single best, most accurate charades answer.
 
 Rules:
@@ -102,7 +108,7 @@ Rules:
 - Guesses must be things commonly acted out in charades: everyday words,
   actions, animals, emotions, movie titles, book titles, song titles, famous
   people, occupations, sports, or common phrases.
-- Look for patterns in the 6 initial guesses — if most agree on a word or
+- Look for patterns in the initial guesses — if most agree on a word or
   theme, that is a strong signal.
 - If the guesses are split, consider which answer best fits the charades
   context.
@@ -137,17 +143,11 @@ def _get_final_agent() -> Agent:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-# Timing constants
-_WINDOW_DURATION_S = 4.0      # seconds per initial-guess window
-_WINDOWS_PER_CYCLE = 6        # number of windows before a final guess (4 x 6 = 24s)
-
 # Cycle state
-_cycle_start_time: float | None = None
 _window_start_time: float | None = None
 _window_frames: list[Frame] = []            # frames for current 4s window
-_pending_tasks: list[asyncio.Task] = []     # in-flight Sonnet tasks
 _initial_guesses: list[str] = []            # completed initial guesses this cycle
-_guess_counter: int = 0                     # for printing [initial #N/6]
+_guess_counter: int = 0                     # for printing [initial #N]
 _cycle_counter: int = 0                     # which cycle we are on
 
 # History of all cycles: list of {"initial_guesses": [...], "final_guess": str}
@@ -156,12 +156,10 @@ _history: list[dict] = []
 
 def _reset_cycle() -> None:
     """Reset all cycle state for the next iteration."""
-    global _cycle_start_time, _window_start_time, _window_frames
-    global _pending_tasks, _initial_guesses, _guess_counter
-    _cycle_start_time = None
+    global _window_start_time, _window_frames
+    global _initial_guesses, _guess_counter
     _window_start_time = None
     _window_frames = []
-    _pending_tasks = []
     _initial_guesses = []
     _guess_counter = 0
 
@@ -207,26 +205,11 @@ async def _initial_guess(frames: list[Frame]) -> str:
     return result.output.strip()
 
 
-async def _initial_guess_task(frames: list[Frame], task_num: int) -> None:
-    """Fire-and-forget wrapper: run initial guess, collect result, print."""
-    start = time.monotonic()
-    try:
-        guess = await _initial_guess(frames)
-        elapsed = time.monotonic() - start
-        _initial_guesses.append(guess)
-        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
-              f"{guess} ({len(frames)} frames, {elapsed:.1f}s)")
-    except Exception as e:
-        elapsed = time.monotonic() - start
-        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
-              f"ERROR: {e} ({elapsed:.1f}s)")
-
-
 async def _final_guess(initial_guesses: list[str]) -> str:
     """Send only text guesses + history to the fast model for consensus."""
     text_lines = [
-        "Here are 6 initial guesses from a vision model that watched a person "
-        "playing charades over the last 24 seconds (one guess per 4-second window):"
+        f"Here are {len(initial_guesses)} initial guesses from a vision model "
+        f"that watched a person playing charades (one guess per 4-second window):"
     ]
     text_lines.append("")
     for i, guess in enumerate(initial_guesses, 1):
@@ -268,70 +251,58 @@ async def analyze(frame: Frame) -> str | None:
 
     Internally:
     - Buffers frames into 4-second windows
-    - At the end of each window, fires off a Sonnet call (fire-and-forget)
-      with all ~40 frames from that window
-    - After 6 windows (24 seconds), waits for all Sonnet results, then
-      sends the 6 text guesses to Haiku for a final consensus answer
+    - At the end of each window, sends all frames to Sonnet and WAITS for the
+      result (blocking — no fire-and-forget)
+    - After collecting the configured number of initial guesses, sends them
+      to Haiku for a final consensus answer
+    - Returns None while buffering/waiting, returns the final guess when ready
     """
-    global _cycle_start_time, _window_start_time, _guess_counter, _cycle_counter
+    global _window_start_time, _guess_counter, _cycle_counter
 
     now = time.monotonic()
 
-    # --- Initialize cycle on first call ---
-    if _cycle_start_time is None:
-        _cycle_start_time = now
+    # --- Initialize window on first call ---
+    if _window_start_time is None:
         _window_start_time = now
-        _cycle_counter += 1
-        print(f"  [agent] Cycle {_cycle_counter} started "
-              f"({_WINDOWS_PER_CYCLE} windows x {_WINDOW_DURATION_S:.0f}s "
-              f"= {_WINDOWS_PER_CYCLE * _WINDOW_DURATION_S:.0f}s)")
+        if _guess_counter == 0:
+            _cycle_counter += 1
+            print(f"  [agent] Cycle {_cycle_counter} started "
+                  f"({_WINDOWS_PER_CYCLE} windows x {_WINDOW_DURATION_S:.0f}s)")
 
     # --- Always buffer the frame ---
     _window_frames.append(frame)
 
     # --- Check if current 4s window is complete ---
-    assert _window_start_time is not None
-    assert _cycle_start_time is not None
     window_elapsed = now - _window_start_time
-    if window_elapsed >= _WINDOW_DURATION_S and _window_frames:
-        _guess_counter += 1
-        task_num = _guess_counter
-        frames = _window_frames[:]
-        _window_frames.clear()
-        _window_start_time = now
-
-        print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} — "
-              f"{len(frames)} frames → Sonnet (fire-and-forget)")
-        task = asyncio.create_task(
-            _initial_guess_task(frames, task_num)
-        )
-        _pending_tasks.append(task)
-
-    # --- Check if full cycle is complete (24s elapsed) ---
-    cycle_elapsed = now - _cycle_start_time
-    if cycle_elapsed < _WINDOW_DURATION_S * _WINDOWS_PER_CYCLE:
+    if window_elapsed < _WINDOW_DURATION_S:
         return None
 
-    # Flush any remaining frames as a final partial window
-    if _window_frames:
-        _guess_counter += 1
-        task_num = _guess_counter
-        frames = _window_frames[:]
-        _window_frames.clear()
+    # --- Window complete: send frames to Sonnet and wait ---
+    _guess_counter += 1
+    task_num = _guess_counter
+    frames = _window_frames[:]
+    _window_frames.clear()
+    _window_start_time = now  # reset for next window
 
-        print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} (final flush) — "
-              f"{len(frames)} frames → Sonnet (fire-and-forget)")
-        task = asyncio.create_task(
-            _initial_guess_task(frames, task_num)
-        )
-        _pending_tasks.append(task)
+    print(f"  [agent] Window {task_num}/{_WINDOWS_PER_CYCLE} — "
+          f"{len(frames)} frames → Sonnet (awaiting)...")
+    start = time.monotonic()
+    try:
+        guess = await _initial_guess(frames)
+        elapsed = time.monotonic() - start
+        _initial_guesses.append(guess)
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"{guess} ({len(frames)} frames, {elapsed:.1f}s)")
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        print(f"  [initial #{task_num}/{_WINDOWS_PER_CYCLE}] "
+              f"ERROR: {e} ({elapsed:.1f}s)")
 
-    # Wait for all in-flight Sonnet tasks to finish
-    if _pending_tasks:
-        pending_count = sum(1 for t in _pending_tasks if not t.done())
-        if pending_count > 0:
-            print(f"  [agent] Waiting for {pending_count} remaining Sonnet task(s)...")
-        await asyncio.gather(*_pending_tasks)
+    # --- Check if we have all initial guesses for this cycle ---
+    if _guess_counter < _WINDOWS_PER_CYCLE:
+        return None
+
+    # --- All windows done: run Haiku for final consensus ---
 
     # Check we have guesses to work with
     if not _initial_guesses:
@@ -346,7 +317,7 @@ async def analyze(frame: Frame) -> str | None:
         _reset_cycle()
         return None
 
-    # --- Run Haiku for final consensus (text-only) ---
+    # Run Haiku
     print(f"  [agent] Final guess (Haiku): {len(_initial_guesses)} initial "
           f"guesses → consensus...")
     final_guess = await _final_guess(_initial_guesses)
